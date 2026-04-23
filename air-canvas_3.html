@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Air Canvas</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; color:#fff; font-family:system-ui,sans-serif; height:100vh; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+
+  #perm { text-align:center; max-width:500px; padding:2rem; }
+  #perm h1 { font-size:2.2rem; margin-bottom:.4rem; }
+  .how { background:#111; border:1px solid #2a2a2a; border-radius:12px; padding:1.2rem 1.5rem; margin:1.2rem 0; text-align:left; }
+  .how-row { display:flex; align-items:center; gap:12px; padding:7px 0; font-size:.92rem; color:#ccc; border-bottom:1px solid #222; }
+  .how-row:last-child { border:none; }
+  .how-icon { font-size:1.5rem; width:36px; text-align:center; flex-shrink:0; }
+  #start-btn { background:#fff; color:#000; border:none; padding:13px 40px; font-size:1rem; font-weight:700; border-radius:8px; cursor:pointer; margin-top:.8rem; }
+  #start-btn:hover { background:#ddd; }
+  #err { color:#f66; margin-top:.8rem; font-size:.9rem; display:none; }
+
+  #app { display:none; position:relative; width:100vw; height:100vh; }
+  video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #dc { z-index:2; }  /* persistent drawing */
+  #oc { z-index:3; pointer-events:none; } /* overlay: cursor + palette */
+
+  #status { position:absolute; bottom:18px; left:50%; transform:translateX(-50%); z-index:10;
+    background:rgba(0,0,0,.72); border:1px solid rgba(255,255,255,.13); border-radius:8px;
+    padding:6px 16px; font-size:.78rem; color:#bbb; white-space:nowrap; backdrop-filter:blur(6px); }
+  #clear-btn { position:absolute; bottom:18px; right:18px; z-index:10;
+    background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.2);
+    color:#fff; padding:9px 20px; font-size:.85rem; border-radius:8px; cursor:pointer; }
+  #clear-btn:hover { background:rgba(255,255,255,.2); }
+</style>
+</head>
+<body>
+
+<div id="perm">
+  <h1>✋ Air Canvas</h1>
+  <div class="how">
+    <div class="how-row"><span class="how-icon">☝️</span><span><b style="color:#fff">Point & draw</b> — index finger traces lines on the canvas</span></div>
+    <div class="how-row"><span class="how-icon">🎨</span><span><b style="color:#fff">Move hand to top of screen</b> — palette appears, hover over a color for a moment to select</span></div>
+    <div class="how-row"><span class="how-icon">✊</span><span><b style="color:#fff">Make a fist</b> — switches to eraser while held</span></div>
+  </div>
+  <button id="start-btn" onclick="init()">Allow Camera &amp; Start Drawing</button>
+  <p id="err"></p>
+</div>
+
+<div id="app">
+  <video id="vid" autoplay playsinline muted></video>
+  <canvas id="dc"></canvas>
+  <canvas id="oc"></canvas>
+  <div id="status">Loading hand model…</div>
+  <button id="clear-btn" onclick="clearCanvas()">🗑 Clear</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+/* ── Palette ────────────────────────────────────────────────── */
+const PAL = [
+  { label:'Erase', color:null,      hex:'#ffffff', isEraser:true  },
+  { label:'Red',   color:'#ff3333', hex:'#ff3333' },
+  { label:'Orange',color:'#ff8800', hex:'#ff8800' },
+  { label:'Yellow',color:'#ffdd00', hex:'#ffdd00' },
+  { label:'Green', color:'#22cc44', hex:'#22cc44' },
+  { label:'Cyan',  color:'#00ccee', hex:'#00ccee' },
+  { label:'Blue',  color:'#2266ff', hex:'#2266ff' },
+  { label:'Purple',color:'#bb33ff', hex:'#bb33ff' },
+  { label:'Pink',  color:'#ff44aa', hex:'#ff44aa' },
+  { label:'White', color:'#ffffff', hex:'#ffffff' },
+];
+
+let vid, dc, dCtx, oc, oCtx;
+let W = 1280, H = 720;
+let lastX = null, lastY = null;
+let smoothX = null, smoothY = null;
+let curIdx = 1;              // current palette index
+let handVisible = false;
+let frameCount  = 0;
+
+/* Dwell (hover to select) */
+let dwellIdx   = -1;
+let dwellStart = 0;
+const DWELL_MS = 700;
+
+/* Fist smoothing */
+const fistBuf = [];
+const FIST_BUF = 8;
+
+/* Position smoothing */
+const POS_ALPHA = 0.45;
+
+/* ── Geometry helpers ───────────────────────────────────────── */
+function d(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y, (a.z||0)-(b.z||0));
+}
+
+/* A finger is "up" when its tip is farther from wrist than its MCP.
+   This works regardless of hand tilt / rotation.               */
+function up(tip, mcp, wrist, k) {
+  return d(tip, wrist) > d(mcp, wrist) * k;
+}
+
+/* Fist = all four main fingers curled down */
+function detectFist(lm) {
+  const w = lm[0];
+  let curled = 0;
+  if (!up(lm[8],  lm[5],  w, 1.15)) curled++;
+  if (!up(lm[12], lm[9],  w, 1.15)) curled++;
+  if (!up(lm[16], lm[13], w, 1.15)) curled++;
+  if (!up(lm[20], lm[17], w, 1.15)) curled++;
+  return curled >= 3;
+}
+
+function smoothFist(val) {
+  fistBuf.push(val ? 1 : 0);
+  if (fistBuf.length > FIST_BUF) fistBuf.shift();
+  return fistBuf.reduce((a,b)=>a+b,0) > FIST_BUF * 0.55;
+}
+
+/* ── Palette geometry (computed once canvas size known) ─────── */
+let palItems = [];   // { cx, cy, r, idx }
+
+function buildPalette() {
+  const ZONE_H  = H * 0.13;        // palette strip height
+  const cy      = ZONE_H * 0.5;
+  const r       = Math.min(ZONE_H * 0.38, 28);
+  const spacing = W / (PAL.length + 1);
+  palItems = PAL.map((_, i) => ({
+    cx: spacing * (i + 1),
+    cy,
+    r,
+    idx: i,
+  }));
+}
+
+function inPaletteZone(y) { return y < H * 0.16; }
+
+function closestPaletteItem(x, y) {
+  let best = -1, bestD = Infinity;
+  for (const p of palItems) {
+    const dd = Math.hypot(x - p.cx, y - p.cy);
+    if (dd < p.r * 1.8 && dd < bestD) { bestD = dd; best = p.idx; }
+  }
+  return best;
+}
+
+/* ── Draw overlay (cursor + palette) ──────────────────────────
+   Called every frame — everything here is ephemeral.           */
+function drawOverlay(tipX, tipY, isFist, inPal, hoveredIdx, dwellFrac) {
+  oCtx.clearRect(0, 0, W, H);
+
+  const inZone = inPal || tipY < H * 0.20;
+
+  /* Palette strip background */
+  const ZONE_H = H * 0.13;
+  if (inZone) {
+    oCtx.fillStyle = 'rgba(0,0,0,0.55)';
+    oCtx.fillRect(0, 0, W, ZONE_H);
+  } else {
+    // subtle strip hint at top
+    oCtx.fillStyle = 'rgba(0,0,0,0.25)';
+    oCtx.fillRect(0, 0, W, ZONE_H * 0.6);
+  }
+
+  /* Palette circles */
+  for (const p of palItems) {
+    const pal  = PAL[p.idx];
+    const isSelected = p.idx === curIdx;
+    const isHovered  = p.idx === hoveredIdx;
+
+    // circle fill
+    oCtx.beginPath();
+    oCtx.arc(p.cx, p.cy, p.r, 0, Math.PI*2);
+    oCtx.fillStyle = pal.hex;
+    oCtx.fill();
+
+    // border
+    oCtx.beginPath();
+    oCtx.arc(p.cx, p.cy, p.r, 0, Math.PI*2);
+    oCtx.strokeStyle = isSelected ? '#fff' : 'rgba(255,255,255,0.25)';
+    oCtx.lineWidth   = isSelected ? 3 : 1.5;
+    oCtx.stroke();
+
+    // eraser X
+    if (pal.isEraser) {
+      oCtx.strokeStyle = '#000';
+      oCtx.lineWidth = 2.5;
+      const s = p.r * 0.4;
+      oCtx.beginPath(); oCtx.moveTo(p.cx-s, p.cy-s); oCtx.lineTo(p.cx+s, p.cy+s); oCtx.stroke();
+      oCtx.beginPath(); oCtx.moveTo(p.cx+s, p.cy-s); oCtx.lineTo(p.cx-s, p.cy+s); oCtx.stroke();
+    }
+
+    // dwell arc
+    if (isHovered && dwellFrac > 0) {
+      oCtx.beginPath();
+      oCtx.arc(p.cx, p.cy, p.r + 6, -Math.PI/2, -Math.PI/2 + Math.PI*2*dwellFrac);
+      oCtx.strokeStyle = '#fff';
+      oCtx.lineWidth   = 3;
+      oCtx.stroke();
+    }
+
+    // selected dot
+    if (isSelected) {
+      oCtx.beginPath();
+      oCtx.arc(p.cx, p.cy + p.r + 8, 4, 0, Math.PI*2);
+      oCtx.fillStyle = '#fff';
+      oCtx.fill();
+    }
+  }
+
+  /* Cursor */
+  const curColor = PAL[curIdx].color || '#fff';
+
+  if (isFist) {
+    // eraser cursor: dashed circle
+    oCtx.beginPath();
+    oCtx.arc(tipX, tipY, 30, 0, Math.PI*2);
+    oCtx.setLineDash([6,4]);
+    oCtx.strokeStyle = 'rgba(255,255,255,0.7)';
+    oCtx.lineWidth = 2;
+    oCtx.stroke();
+    oCtx.setLineDash([]);
+  } else if (inPal) {
+    // palette zone: arrow cursor
+    oCtx.beginPath();
+    oCtx.arc(tipX, tipY, 10, 0, Math.PI*2);
+    oCtx.fillStyle = 'rgba(255,255,255,0.8)';
+    oCtx.fill();
+  } else {
+    // draw cursor
+    oCtx.beginPath();
+    oCtx.arc(tipX, tipY, 20, 0, Math.PI*2);
+    oCtx.strokeStyle = 'rgba(255,255,255,0.5)';
+    oCtx.lineWidth = 2;
+    oCtx.stroke();
+    oCtx.beginPath();
+    oCtx.arc(tipX, tipY, 7, 0, Math.PI*2);
+    oCtx.fillStyle = curColor;
+    oCtx.fill();
+  }
+}
+
+/* ── Core result handler ────────────────────────────────────── */
+function onResults(res) {
+  if (!dCtx || !oCtx) return;
+
+  if (!res.multiHandLandmarks || !res.multiHandLandmarks.length) {
+    handVisible = false;
+    lastX = null; lastY = null;
+    smoothX = null; smoothY = null;
+    oCtx.clearRect(0, 0, W, H);
+    // re-draw palette strip hint even with no hand
+    drawOverlay(0, H, false, false, -1, 0);
+    setStatus('✅ Ready — show your hand');
+    return;
+  }
+
+  handVisible = true;
+  const lm = res.multiHandLandmarks[0];
+
+  /* Index fingertip, mirrored */
+  const rawX = (1 - lm[8].x) * W;
+  const rawY =      lm[8].y  * H;
+  smoothX = smoothX === null ? rawX : smoothX + (rawX - smoothX) * (1 - POS_ALPHA);
+  smoothY = smoothY === null ? rawY : smoothY + (rawY - smoothY) * (1 - POS_ALPHA);
+  const tx = smoothX, ty = smoothY;
+
+  const fist  = smoothFist(detectFist(lm));
+  const inPal = inPaletteZone(ty);
+
+  /* ── Palette zone logic ─────────────────────────────────── */
+  let hovIdx   = -1;
+  let dwellFrac = 0;
+
+  if (inPal && !fist) {
+    const hov = closestPaletteItem(tx, ty);
+    if (hov >= 0) {
+      hovIdx = hov;
+      if (hov !== dwellIdx) { dwellIdx = hov; dwellStart = performance.now(); }
+      const elapsed = performance.now() - dwellStart;
+      dwellFrac = Math.min(elapsed / DWELL_MS, 1);
+      if (dwellFrac >= 1) {
+        curIdx  = hov;
+        dwellIdx = -1;
+        setStatus(`🎨 ${PAL[hov].label} selected`);
+      }
+    } else {
+      dwellIdx = -1;
+    }
+    // don't draw in palette zone
+    lastX = null; lastY = null;
+
+  /* ── Drawing / eraser logic ─────────────────────────────── */
+  } else {
+    dwellIdx = -1;
+
+    if (lastX !== null) {
+      dCtx.beginPath();
+      dCtx.moveTo(lastX, lastY);
+      dCtx.lineTo(tx, ty);
+      dCtx.lineCap  = 'round';
+      dCtx.lineJoin = 'round';
+
+      if (fist) {
+        dCtx.globalCompositeOperation = 'destination-out';
+        dCtx.strokeStyle = 'rgba(0,0,0,1)';
+        dCtx.lineWidth   = 64;
+        dCtx.shadowBlur  = 0;
+      } else {
+        const col = PAL[curIdx].color || 'rgba(0,0,0,0)';
+        dCtx.globalCompositeOperation = 'source-over';
+        dCtx.strokeStyle = col;
+        dCtx.lineWidth   = 7;
+        dCtx.shadowColor = col;
+        dCtx.shadowBlur  = 12;
+      }
+      dCtx.stroke();
+      dCtx.shadowBlur = 0;
+    }
+
+    lastX = tx; lastY = ty;
+    setStatus(fist ? '✊ Erasing…' : `Drawing · ${PAL[curIdx].label}`);
+  }
+
+  drawOverlay(tx, ty, fist, inPal, hovIdx, dwellFrac);
+}
+
+/* ── Canvas init ────────────────────────────────────────────── */
+function setSize(w, h) {
+  W = w; H = h;
+  dc.width = W; dc.height = H;
+  oc.width = W; oc.height = H;
+  dCtx = dc.getContext('2d');
+  oCtx = oc.getContext('2d');
+  buildPalette();
+  drawOverlay(0, H, false, false, -1, 0); // draw initial palette hint
+}
+
+function init() {
+  document.getElementById('start-btn').disabled = true;
+  document.getElementById('start-btn').textContent = 'Starting…';
+
+  navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }})
+    .then(stream => {
+      document.getElementById('perm').style.display = 'none';
+      document.getElementById('app').style.display  = 'block';
+
+      vid = document.getElementById('vid');
+      dc  = document.getElementById('dc');
+      oc  = document.getElementById('oc');
+      vid.srcObject = stream;
+
+      vid.onloadedmetadata = () => setSize(vid.videoWidth || 1280, vid.videoHeight || 720);
+      setTimeout(() => { if (!dCtx) setSize(1280, 720); }, 1800);
+
+      startTracking();
+    })
+    .catch(e => {
+      const el = document.getElementById('err');
+      el.textContent = 'Camera error: ' + e.message;
+      el.style.display = 'block';
+      document.getElementById('start-btn').disabled = false;
+      document.getElementById('start-btn').textContent = 'Allow Camera & Start Drawing';
+    });
+}
+
+function startTracking() {
+  if (typeof Hands === 'undefined') { setStatus('❌ Model failed — refresh'); return; }
+
+  const hands = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`
+  });
+  hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.65, minTrackingConfidence:0.55 });
+  hands.onResults(onResults);
+
+  if (typeof Camera === 'undefined') { setStatus('❌ Camera util failed — refresh'); return; }
+
+  const cam = new Camera(vid, {
+    onFrame: async () => { frameCount++; await hands.send({ image: vid }); },
+    width: 1280, height: 720
+  });
+  cam.start()
+    .then(() => setStatus('✅ Ready — show your hand!'))
+    .catch(e => setStatus('Error: ' + e.message));
+
+  setInterval(() => {
+    if (!handVisible) setStatus(`✅ Frame ${frameCount} — show your hand`);
+  }, 2500);
+}
+
+function clearCanvas() {
+  if (dCtx) dCtx.clearRect(0, 0, W, H);
+  lastX = null; lastY = null;
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+</script>
+</body>
+</html>
